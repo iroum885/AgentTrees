@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>plugintree · 决策树查看器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip-link" href="#tree-svg">跳到决策树画布</a>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">◧</span>
+    <h1>plugintree</h1>
+    <select id="workspace-select" class="workspace-select" aria-label="切换工作区" title="切换工作区"></select>
+    <span id="workspace-label" class="workspace-label" title="工作区"></span>
+  </div>
+  <div class="topbar-status">
+    <label class="check" title="Agent 在别的工作区干活时，页面自动跟过去"><input id="auto-follow" type="checkbox" checked><span>自动跟随</span></label>
+    <span id="conn-indicator" class="conn" data-state="connecting">
+      <span class="conn-dot" aria-hidden="true"></span>
+      <span id="conn-text">连接中…</span>
+    </span>
+    <span id="toast" class="toast" role="status" aria-live="polite" hidden></span>
+  </div>
+</header>
+
+<div id="layout" class="layout">
+  <aside class="sidebar" aria-label="回合列表">
+    <div class="sidebar-filter">
+      <label class="field">
+        <span class="field-label">按问题筛选</span>
+        <input id="filter-input" type="search" placeholder="输入关键词…" autocomplete="off" aria-describedby="origin-filter">
+      </label>
+      <div id="origin-filter" class="origin-filter" role="group" aria-label="按来源筛选">
+        <span class="field-label">来源</span>
+        <label class="check"><input id="origin-live" type="checkbox" checked><span>实时</span></label>
+        <label class="check"><input id="origin-history" type="checkbox" checked><span>历史</span></label>
+        <label class="check" title="只显示新的和正在进行的回合"><input id="only-new" type="checkbox"><span>只看新回合</span></label>
+      </div>
+      <p id="turn-count" class="turn-count">—</p>
+    </div>
+    <nav class="turn-list-wrap" aria-label="回合">
+      <ul id="turn-list" class="turn-list"></ul>
+    </nav>
+  </aside>
+
+  <main class="main" aria-label="决策树">
+    <div class="toolbar" role="toolbar" aria-label="工具栏">
+      <div class="toolbar-group" role="group" aria-label="操作">
+        <button id="btn-fit" class="btn" type="button">适应窗口</button>
+        <button id="btn-refresh" class="btn" type="button">刷新</button>
+      </div>
+      <div class="toolbar-group" role="group" aria-label="导出">
+        <button id="btn-export-html" class="btn" type="button">导出 HTML</button>
+        <button id="btn-export-md" class="btn" type="button">导出 Markdown</button>
+      </div>
+      <div class="toolbar-group toolbar-group-end" role="group" aria-label="视图">
+        <span id="zoom-label" class="zoom-label" aria-live="off">100%</span>
+        <button id="btn-detail" class="btn btn-toggle" type="button" aria-expanded="true" aria-controls="detail-panel">详情面板</button>
+      </div>
+      <p id="tree-hint" class="toolbar-hint" role="status" aria-live="polite" hidden></p>
+    </div>
+
+    <div id="canvas-wrap" class="canvas-wrap">
+      <svg id="tree-svg" class="tree-svg" role="tree" aria-label="决策树画布" tabindex="0"></svg>
+      <div id="canvas-overlay" class="canvas-overlay"></div>
+      <div id="live-badge" class="live-badge" role="status" aria-live="polite" hidden></div>
+    </div>
+  </main>
+
+  <aside id="detail-panel" class="detail-panel" aria-label="节点详情">
+    <header class="detail-head">
+      <h2 id="detail-title">节点详情</h2>
+      <span id="detail-kind" class="detail-kind"></span>
+    </header>
+    <div id="detail-body" class="detail-body"></div>
+  </aside>
+</div>
+
+<p id="sr-status" class="visually-hidden" role="status" aria-live="polite"></p>
+<noscript><p class="noscript">plugintree 查看器需要启用 JavaScript。</p></noscript>
+<script type="module" src="app.js"></script>
+</body>
+</html>

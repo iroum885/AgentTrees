@@ -1,0 +1,5 @@
+# plugintree 运行数据（含完整对话内容，不要提交）
+.plugintree/
+
+node_modules/
+*.log

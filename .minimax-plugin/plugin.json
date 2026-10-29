@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "name": "plugintree",
+  "displayName": "PluginTree 思维链树",
+  "version": "1.0.0",
+  "description": "记录每次提问后 Agent 的思考、决策、执行与询问，实时生成树状思维链，并在本地浏览器中可视化。",
+  "author": "User",
+  "icon": "icon.png",
+  "darkIcon": "icon-dark.png",
+  "category": "Code",
+  "exampleQueries": [
+    "打开思维链树，让我看看你这次是怎么一步步做下来的。",
+    "把刚才那次提问的决策过程导出成 Markdown。",
+    "回填最近 20 个历史会话的思维链树。"
+  ],
+  "apps": [],
+  "mcpServers": [],
+  "skills": ["skills/plugintree/SKILL.md"],
+  "hooks": ["hooks/hooks.json"]
+}
