@@ -50,6 +50,9 @@ const COLLECT = path.join(ROOT, 'scripts', 'collect.mjs');
 // temporary workspace must never show up in the real workspace switcher.
 const REGISTRY_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'plugintree-registry-'));
 process.env.MINIMAX_DATA_DIR = REGISTRY_HOME;
+// The test workspace lives in the OS temp folder, which the registry ignores
+// on purpose; this switch lets the test look at it anyway.
+process.env.PLUGINTREE_ALLOW_TEMP_WORKSPACE = '1';
 
 let passed = 0;
 let failed = 0;
@@ -415,6 +418,14 @@ check('listTrees reports whether a turn is still running',
 // ----------------------------------------------------------- workspace registry
 section('Workspace registry');
 const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+
+// A scratch folder is not a workspace worth offering.
+delete process.env.PLUGINTREE_ALLOW_TEMP_WORKSPACE;
+check('a scratch workspace is kept out of the switcher',
+  !listRegisteredWorkspaces().some((w) => samePath(w.root, workspace)),
+  JSON.stringify(listRegisteredWorkspaces().map((w) => w.root)));
+process.env.PLUGINTREE_ALLOW_TEMP_WORKSPACE = '1';
+
 const registered = listRegisteredWorkspaces();
 check('the collector registered the workspace it worked in',
   registered.some((w) => samePath(w.root, workspace)),
@@ -426,6 +437,9 @@ check('a workspace gets a readable label', workspaceLabel(workspace) === path.ba
   workspaceLabel(workspace));
 
 const otherWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'plugintree-other-'));
+// A workspace only shows up once it holds something worth looking at.
+fs.mkdirSync(path.join(otherWorkspace, '.plugintree', 'events'), { recursive: true });
+fs.writeFileSync(path.join(otherWorkspace, '.plugintree', 'events', 'seed.jsonl'), '{}\n', 'utf8');
 registerWorkspace(otherWorkspace, { eventTs: Date.now() + 1000 });
 check('registering another workspace adds it to the list',
   listRegisteredWorkspaces().some((w) => samePath(w.root, otherWorkspace)));

@@ -1,8 +1,9 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-import { resolveDataDir, ensureDir } from './paths.mjs';
+import { resolveDataDir, ensureDir, eventsDir, historyEventsDir, treesDir } from './paths.mjs';
 import { readJson, writeJsonAtomic } from './util.mjs';
 
 /**
@@ -74,7 +75,46 @@ export function registerWorkspace(root, info = {}) {
 }
 
 /**
- * Drop the entries of workspaces that are gone.
+ * Is this a throwaway folder in the OS temp directory?
+ *
+ * Test runs and one-off scripts work there; such a workspace is scratch
+ * space, never a project the user wants to monitor.
+ */
+export function isTemporaryWorkspace(root) {
+  if (!root) return false;
+  // The self-test runs in a scratch folder and needs to see it.
+  if (process.env.PLUGINTREE_ALLOW_TEMP_WORKSPACE === '1') return false;
+  let temp = '';
+  try {
+    temp = path.resolve(os.tmpdir());
+  } catch {
+    return false;
+  }
+  const resolved = path.resolve(root);
+  const relative = path.relative(temp, resolved);
+  return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+/**
+ * Does this workspace hold anything worth showing?
+ *
+ * A workspace that recorded no turn has nothing to switch to, so it stays
+ * out of the list.
+ */
+export function hasRecords(root) {
+  if (!root) return false;
+  for (const dir of [eventsDir(root), historyEventsDir(root), treesDir(root)]) {
+    try {
+      if (fs.readdirSync(dir).length) return true;
+    } catch {
+      /* the folder does not exist */
+    }
+  }
+  return false;
+}
+
+/**
+ * Drop the entries of workspaces that are gone or hold nothing.
  *
  * The registry is a cache of places the agent worked in; a temporary folder
  * that was deleted should not stay in the switcher forever.
@@ -97,7 +137,7 @@ export function pruneDeadWorkspaces() {
     } catch {
       alive = false;
     }
-    if (alive) continue;
+    if (alive && hasRecords(entry.root) && !isTemporaryWorkspace(entry.root)) continue;
     try {
       fs.unlinkSync(file);
     } catch {
@@ -119,6 +159,8 @@ export function listRegisteredWorkspaces() {
     if (!name.endsWith('.json')) continue;
     const entry = readJson(path.join(registryDir(), name), null);
     if (!entry || typeof entry.root !== 'string' || !entry.root) continue;
+    if (!hasRecords(entry.root)) continue;
+    if (isTemporaryWorkspace(entry.root)) continue;
     out.push({
       root: entry.root,
       label: entry.label || workspaceLabel(entry.root),

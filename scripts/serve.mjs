@@ -14,7 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { resolveWorkspaceRoot, PLUGIN_ROOT } from './lib/paths.mjs';
-import { listRegisteredWorkspaces, workspaceLabel } from './lib/registry.mjs';
+import { listRegisteredWorkspaces, registerWorkspace, workspaceLabel } from './lib/registry.mjs';
 import {
   listTrees,
   readTree,
@@ -62,6 +62,12 @@ let currentWorkspace = resolveWorkspaceRoot(args.workspace);
 let autoFollow = true;
 ensureDataLayout(currentWorkspace);
 let config = readConfig(currentWorkspace);
+// The workspace the viewer starts in belongs in the switcher as well.
+try {
+  registerWorkspace(currentWorkspace);
+} catch {
+  /* the registry is a convenience */
+}
 
 /** Connected SSE clients. */
 const clients = new Set();
@@ -178,6 +184,9 @@ function switchWorkspace(next, reason) {
   try {
     ensureDataLayout(resolved);
     config = readConfig(resolved);
+    // The viewer remembers the workspaces it looks at, so the switcher keeps
+    // offering them even before a hook ever ran there.
+    registerWorkspace(resolved);
   } catch {
     /* an unreadable workspace simply shows an empty list */
   }
@@ -429,6 +438,16 @@ function listen(port) {
 
 const desiredPort = Number.isFinite(args.port) ? args.port : config.port ?? 47731;
 let actualPort = desiredPort;
+
+// Read the turn list once before the server starts, so the first page load
+// does not have to wait for the trees to be parsed.
+try {
+  listTrees(currentWorkspace);
+  listSessions(currentWorkspace);
+} catch {
+  /* an unreadable workspace simply shows an empty list */
+}
+
 try {
   actualPort = await listen(desiredPort);
 } catch {

@@ -50,6 +50,34 @@ export function resetSessionEvents(workspaceRoot, sessionId, origin = 'live') {
   return file;
 }
 
+/**
+ * A summary of one file on disk, cached by its size and modification time.
+ *
+ * The turn list only needs a few fields per tree, but a tree file holds the
+ * whole thinking transcript — megabytes each. Parsing every tree on every
+ * poll made the viewer slow, so the summary is kept and only recomputed when
+ * the file actually changed.
+ */
+const summaryCache = new Map();
+
+/** The cached summary of a file, or null when it has to be read again. */
+function cachedSummary(file, read) {
+  let stat = null;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    summaryCache.delete(file);
+    return null;
+  }
+  const hit = summaryCache.get(file);
+  if (hit && hit.size === stat.size && hit.mtimeMs === stat.mtimeMs) {
+    return hit.value;
+  }
+  const value = read();
+  summaryCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, value });
+  return value;
+}
+
 export function listSessions(workspaceRoot) {
   const out = [];
   for (const [origin, dir] of [
@@ -65,15 +93,19 @@ export function listSessions(workspaceRoot) {
     for (const name of names) {
       if (!name.endsWith('.jsonl')) continue;
       const sessionId = name.slice(0, -6);
-      const events = readJsonl(path.join(dir, name));
-      const last = events.length ? events[events.length - 1] : null;
-      out.push({
-        sessionId,
-        origin,
-        eventCount: events.length,
-        lastTs: last?.ts ?? null,
-        cwd: last?.cwd ?? null,
+      const file = path.join(dir, name);
+      // The session list only needs the last event and how many there are,
+      // so the whole event log is not read on every poll.
+      const summary = cachedSummary(file, () => {
+        const events = readJsonl(file);
+        const last = events.length ? events[events.length - 1] : null;
+        return {
+          eventCount: events.length,
+          lastTs: last?.ts ?? null,
+          cwd: last?.cwd ?? null,
+        };
       });
+      out.push({ sessionId, origin, ...summary });
     }
   }
   return out;
@@ -86,6 +118,8 @@ export function treeFile(workspaceRoot, turnId) {
 export function writeTree(workspaceRoot, tree) {
   const file = treeFile(workspaceRoot, tree.turnId);
   writeJsonAtomic(file, tree);
+  // The file changed, so the cached summary is stale.
+  summaryCache.delete(file);
   return file;
 }
 
@@ -103,20 +137,27 @@ export function listTrees(workspaceRoot) {
   const out = [];
   for (const name of names) {
     if (!name.endsWith('.json') || name.endsWith('.mech.json')) continue;
-    const tree = readJson(path.join(treesDir(workspaceRoot), name), null);
-    if (!tree) continue;
-    out.push({
-      turnId: tree.turnId,
-      sessionId: tree.sessionId ?? null,
-      question: tree.question ?? '',
-      origin: tree.origin ?? 'live',
-      nodeCount: Array.isArray(tree.nodes) ? tree.nodes.length : 0,
-      ts: tree.ts ?? null,
-      updatedAt: tree.updatedAt ?? null,
-      // The turn is still in flight when no `stop` event closed it yet.
-      running: tree.running === true,
-      lastEventTs: tree.lastEventTs ?? null,
+    const file = path.join(treesDir(workspaceRoot), name);
+    // Only the few fields the turn list shows are needed, so the tree file
+    // itself is parsed once and then reused until it changes on disk.
+    const summary = cachedSummary(file, () => {
+      const tree = readJson(file, null);
+      if (!tree) return null;
+      return {
+        turnId: tree.turnId,
+        sessionId: tree.sessionId ?? null,
+        question: tree.question ?? '',
+        origin: tree.origin ?? 'live',
+        nodeCount: Array.isArray(tree.nodes) ? tree.nodes.length : 0,
+        ts: tree.ts ?? null,
+        updatedAt: tree.updatedAt ?? null,
+        // The turn is still in flight when no `stop` event closed it yet.
+        running: tree.running === true,
+        lastEventTs: tree.lastEventTs ?? null,
+      };
     });
+    if (!summary) continue;
+    out.push(summary);
   }
   return out.sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0));
 }

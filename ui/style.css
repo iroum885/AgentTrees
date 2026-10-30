@@ -619,6 +619,19 @@ body {
   stroke-linecap: round;
 }
 
+/* The main path runs straight down the middle: it is drawn heavier so the
+   spine of the drawing is easy to follow. */
+.pt-edge-spine {
+  stroke: var(--n-scheme);
+  stroke-width: 2;
+  opacity: 0.65;
+}
+
+/* Branches curve away from the spine and stay lighter than the spine. */
+.pt-edge-branch { opacity: 0.75; }
+.pt-edge-left { stroke: var(--n-execution); }
+.pt-edge-right { stroke: var(--n-reasoning); }
+
 .pt-arrow-head { fill: var(--node-edge); }
 
 .pt-node { cursor: pointer; }

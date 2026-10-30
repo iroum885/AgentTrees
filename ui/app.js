@@ -7,9 +7,10 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 /* ------------------------------------------------------------------ */
 const NODE_W = 300;
 const NODE_H = 88;
-const LEAF_GAP = 330;
-const BASE_GAP = 54;
-const DEPTH_EXTRA = 10;
+/** Horizontal distance between two lanes: the spine, then one lane per branch. */
+const LANE_GAP = 330;
+/** Vertical distance between two rows. */
+const ROW_GAP = 54;
 const TITLE_MAX_LINES = 2;
 const TITLE_LINE_STEP = 15;
 const TITLE_FONT_SIZE = 11;
@@ -341,13 +342,40 @@ function wrapTitle(text, maxWidth, maxLines) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Build a layered top-down layout from a flat node list.
+ * The drawing is a spine with branches, not a pyramid.
+ *
+ * The main path — the question at the top and every strategy step below it —
+ * runs down one straight vertical line through the middle of the canvas.
+ * Everything that hangs off that line is a branch: a branch that leans
+ * towards doing (an execution, a note) opens to the left, a branch that
+ * leans towards thinking (a parallel strategy) opens to the right.
+ *
+ * Rows still follow the depth of the tree, so a branch leaves its parent and
+ * lands on the same row as the node that follows the parent on the spine.
+ */
+/**
+ * The node types that lean towards thinking rather than towards doing.
+ *
+ * A strategy, a question to the user and a delegated sub-agent are all
+ * thoughts; an execution and a note are things the agent did.
+ */
+const THINKING_TYPES = new Set(['scheme', 'reasoning', 'ask', 'subagent']);
+
+/** Does this node lean towards thinking rather than towards doing? */
+function isThinking(node) {
+  return THINKING_TYPES.has(node?.type);
+}
+
+/**
+ * Build a centred-spine layout from a flat node list.
  *
  * Nodes are linked through `parentId` only (`children` is ignored).
- * Depth comes from the parent chain. Leaf nodes receive sequential x
- * positions in DFS order; every parent is centred over its children, so
- * two nodes on the same level can never overlap because sibling subtrees
- * occupy disjoint, increasing leaf ranges.
+ *
+ * The spine is the chain of thinking: from the root the layout follows the
+ * strategy that carries the run forward, so the main path is a single
+ * vertical line at x = 0. Every other node becomes a branch of that spine:
+ * the ones that do something are placed in lanes on the left, the ones that
+ * think in lanes on the right, and a branch keeps its side as it grows.
  */
 export function layoutTree(rawNodes) {
   const list = (Array.isArray(rawNodes) ? rawNodes : [])
@@ -395,67 +423,177 @@ export function layoutTree(rawNodes) {
     }
   }
 
-  const xs = new Map();
-  let leafIndex = 0;
-  const assign = (entry, depth) => {
-    if (!entry.children.length) {
-      xs.set(entry.id, leafIndex * LEAF_GAP);
-      leafIndex += 1;
-      return;
-    }
-    const childXs = [];
-    for (const kid of entry.children) {
-      assign(kid, depth + 1);
-      childXs.push(xs.get(kid.id));
-    }
-    const first = childXs[0];
-    const last = childXs[childXs.length - 1];
-    xs.set(entry.id, (first + last) / 2);
+  // How deep is this node? The parent chain decides it.
+  const depthMemo = new Map();
+  const depthOf = (entry) => {
+    const cached = depthMemo.get(entry.id);
+    if (cached !== undefined) return cached;
+    const parent = entry.parentId ? entryById.get(entry.parentId) : null;
+    const depth = parent ? depthOf(parent) + 1 : 0;
+    depthMemo.set(entry.id, depth);
+    return depth;
   };
-  for (const root of roots) assign(root, 0);
+
+  // How tall is the subtree under this node? The tallest thinking branch
+  // below a node is the one that carries the main path further down.
+  const heightMemo = new Map();
+  const heightOf = (entry) => {
+    const cached = heightMemo.get(entry.id);
+    if (cached !== undefined) return cached;
+    let tallest = 0;
+    for (const kid of entry.children) tallest = Math.max(tallest, heightOf(kid));
+    const height = tallest + 1;
+    heightMemo.set(entry.id, height);
+    return height;
+  };
+
+  const spineChildOf = (entry) => {
+    let best = null;
+    for (const kid of entry.children) {
+      if (!isThinking(kid.node)) continue;
+      if (!best || heightOf(kid) > heightOf(best)) best = kid;
+    }
+    return best;
+  };
+
+  // The main path: the question at the top, then every strategy step.
+  const mainRoot = roots.reduce(
+    (best, root) => (heightOf(root) > heightOf(best) ? root : best),
+    roots[0],
+  );
+  const spine = [];
+  const continuation = new Map();
+  let cursor = mainRoot;
+  while (cursor) {
+    spine.push(cursor);
+    const next = spineChildOf(cursor);
+    if (!next) break;
+    continuation.set(cursor.id, next.id);
+    cursor = next;
+  }
+
+  // Lane 0 is the spine. Negative lanes are on the left (doing), positive
+  // lanes on the right (thinking).
+  const laneOf = new Map();
+  const sideOf = new Map();
+  // The outermost lane already used at a given row and side, so two
+  // branches never claim the same slot.
+  const laneUse = new Map();
+  for (const entry of spine) {
+    laneOf.set(entry.id, 0);
+    sideOf.set(entry.id, 'center');
+  }
+
+  /**
+   * Place a branch node and everything below it.
+   *
+   * A branch keeps the side of the spine node it hangs off, and every step
+   * further down moves one lane further out, so a branch never folds back
+   * over the main path.
+   */
+  const placeBranch = (entry, side, lane) => {
+    laneOf.set(entry.id, lane);
+    sideOf.set(entry.id, side);
+    const key = `${depthOf(entry) + 1}:${side}`;
+    let magnitude = Math.max((laneUse.get(key) ?? 0) + 1, Math.abs(lane) + 1);
+    for (const kid of entry.children) {
+      const kidLane = side === 'left' ? -magnitude : magnitude;
+      laneUse.set(key, magnitude);
+      placeBranch(kid, side, kidLane);
+      magnitude += 1;
+    }
+  };
+
+  /**
+   * Place the branches of one spine node: doing on the left, thinking on
+   * the right, the first branch closest to the main path.
+   */
+  const placeBranches = (entry, children) => {
+    const groups = [
+      { side: 'left', list: children.filter((kid) => !isThinking(kid.node)) },
+      { side: 'right', list: children.filter((kid) => isThinking(kid.node)) },
+    ];
+    for (const group of groups) {
+      const key = `${depthOf(entry) + 1}:${group.side}`;
+      let magnitude = (laneUse.get(key) ?? 0) + 1;
+      for (const kid of group.list) {
+        const lane = group.side === 'left' ? -magnitude : magnitude;
+        laneUse.set(key, magnitude);
+        placeBranch(kid, group.side, lane);
+        magnitude += 1;
+      }
+    }
+  };
+
+  for (const entry of spine) {
+    const nextId = continuation.get(entry.id);
+    placeBranches(entry, entry.children.filter((kid) => kid.id !== nextId));
+  }
+
+  // A malformed tree can have more than one root: the extras hang off to
+  // the left instead of sitting on top of the main path.
+  const extraRoots = roots.filter((root) => root.id !== mainRoot.id);
+  extraRoots.forEach((root) => {
+    const key = `${depthOf(root)}:left`;
+    const magnitude = (laneUse.get(key) ?? 0) + 1;
+    laneUse.set(key, magnitude);
+    placeBranch(root, 'left', -magnitude);
+  });
 
   const records = [];
   const recordById = new Map();
-  const build = (entry, depth) => {
+  const build = (entry) => {
+    const depth = depthOf(entry);
     const record = {
       id: entry.id,
       node: entry.node,
-      x: xs.get(entry.id) ?? 0,
-      y: 0,
+      x: (laneOf.get(entry.id) ?? 0) * LANE_GAP,
+      y: depth * (NODE_H + ROW_GAP),
       depth,
+      lane: laneOf.get(entry.id) ?? 0,
+      side: sideOf.get(entry.id) ?? 'center',
       parentId: entry.parentId,
       childIds: [],
       siblingIds: [],
       siblingIndex: 0,
+      /** Position among the siblings that share this side. */
+      sideSlot: 0,
+      /** How many siblings share this side. */
+      sideCount: 1,
     };
     recordById.set(entry.id, record);
     records.push(record);
     entry.children.forEach((kid, index) => {
-      const childRecord = build(kid, depth + 1);
+      const childRecord = build(kid);
       record.childIds.push(kid.id);
       childRecord.siblingIds = entry.children.map((k) => k.id);
       childRecord.siblingIndex = index;
     });
+    // The branches of one node each get their own level in the gap between
+    // the rows, so their lines never run on top of each other.
+    const sides = new Map();
+    for (const kid of entry.children) {
+      const side = sideOf.get(kid.id) ?? 'center';
+      if (!sides.has(side)) sides.set(side, []);
+      sides.get(side).push(kid.id);
+    }
+    for (const [side, ids] of sides) {
+      ids.forEach((id, slot) => {
+        const record2 = recordById.get(id);
+        if (!record2) return;
+        record2.sideSlot = slot;
+        record2.sideCount = ids.length;
+      });
+    }
     return record;
   };
-  roots.forEach((root) => build(root, 0));
+  roots.forEach((root) => build(root));
   const rootIds = roots.map((r) => r.id);
   roots.forEach((root, index) => {
     const record = recordById.get(root.id);
     record.siblingIds = rootIds;
     record.siblingIndex = index;
   });
-
-  const depthY = [];
-  const yForDepth = (depth) => {
-    while (depthY.length <= depth) {
-      const i = depthY.length;
-      if (i === 0) depthY.push(0);
-      else depthY.push(depthY[i - 1] + NODE_H + BASE_GAP + (i - 1) * DEPTH_EXTRA);
-    }
-    return depthY[depth];
-  };
-  for (const record of records) record.y = yForDepth(record.depth);
 
   let minX = Infinity;
   let maxX = -Infinity;
@@ -477,7 +615,15 @@ export function layoutTree(rawNodes) {
     maxY: maxY + LABEL_PAD,
   };
 
-  return { records, byId: recordById, bounds };
+  return {
+    records,
+    byId: recordById,
+    bounds,
+    /** The main path always runs down this x, so the view can centre it. */
+    spineX: 0,
+    /** The nodes of the main path, from the question downwards. */
+    spineIds: spine.map((entry) => entry.id),
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -502,11 +648,12 @@ function filteredTurns() {
 
 function renderSidebar() {
   const list = els.turnList;
-  list.replaceChildren();
   const visible = filteredTurns();
 
   if (!state.turns.length) {
     els.turnCount.textContent = '0 个回合';
+    list.replaceChildren();
+    list.dataset.key = '';
     list.appendChild(el('li', 'turn-empty', '暂无回合记录'));
     return;
   }
@@ -515,12 +662,38 @@ function renderSidebar() {
     : `${visible.length} / ${state.turns.length} 个回合`;
 
   if (!visible.length) {
+    list.replaceChildren();
+    list.dataset.key = '';
     list.appendChild(el('li', 'turn-empty', '没有匹配的回合'));
     return;
   }
 
+  // The rows are only rebuilt when the set of rounds changes. While a round is
+  // running its node count keeps ticking, and rebuilding the whole list for
+  // that alone would make the rows flicker and lose their place.
+  const key = visible.map((t) => t.turnId).join('|');
+  if (list.dataset.key === key) {
+    for (const turn of visible) {
+      const row = list.querySelector(`[data-turn-id="${CSS.escape(turn.turnId)}"]`);
+      if (!row) continue;
+      const counter = row.querySelector('.turn-count-badge');
+      if (counter) counter.textContent = `${turn.nodeCount ?? 0} 节点`;
+      const button = row.querySelector('.turn-row');
+      if (button) {
+        const active = turn.turnId === state.selectedTurnId;
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-current', active ? 'true' : 'false');
+      }
+    }
+    return;
+  }
+
+  list.replaceChildren();
+  list.dataset.key = key;
+
   for (const turn of visible) {
     const item = document.createElement('li');
+    item.dataset.turnId = turn.turnId;
     const button = el('button', 'turn-row');
     button.type = 'button';
     const active = turn.turnId === state.selectedTurnId;
@@ -627,7 +800,7 @@ function buildNodeElement(record) {
   const action = node.actionKind ? actionMeta(node) : null;
 
   const group = svgEl('g', {
-    class: `pt-node type-${type}${action ? ` act-${action.tone}` : ''}`,
+    class: `pt-node type-${type}${action ? ` act-${action.tone}` : ''} side-${record.side ?? 'center'}`,
     tabindex: '0',
     role: 'treeitem',
     'aria-level': String(record.depth + 1),
@@ -734,15 +907,40 @@ function buildNodeElement(record) {
   return group;
 }
 
+/**
+ * The edge between a node and its child.
+ *
+ * The main path is a straight line: one strategy below the other, drawn a
+ * little heavier so the spine of the drawing is easy to follow.
+ *
+ * A branch drops out of the bottom of its parent, travels sideways through
+ * the gap between the two rows and enters the child from above. Each branch
+ * of the same parent uses its own level inside that gap, so several
+ * branches never draw over each other.
+ */
 function buildEdgeElement(parent, child) {
-  const x1 = parent.x;
   const y1 = parent.y + NODE_H;
-  const x2 = child.x;
   const y2 = child.y;
-  const midY = y1 + Math.max(16, (y2 - y1) / 2);
+  if (Math.abs(parent.x - child.x) < 1) {
+    const path = svgEl('path', {
+      class: 'pt-edge pt-edge-spine',
+      d: `M ${parent.x} ${y1} L ${parent.x} ${y2}`,
+    });
+    return path;
+  }
+  const dir = child.x > parent.x ? 1 : -1;
+  // Leave the parent at its bottom edge, a little towards the side the
+  // branch goes to, so the line does not start in the middle of the card.
+  const x0 = parent.x + dir * Math.min(60, NODE_W / 4);
+  // The gap between the rows holds every line of this level; each branch
+  // takes one band of it.
+  const gap = Math.max(1, y2 - y1);
+  const band = Math.max(3, Math.min(12, gap / Math.max(2, child.sideCount + 1)));
+  const midY = y1 + Math.min(gap - 2, 6 + child.sideSlot * band);
+  const d = `M ${x0} ${y1} L ${x0} ${midY} L ${child.x} ${midY} L ${child.x} ${y2}`;
   const path = svgEl('path', {
-    class: 'pt-edge',
-    d: `M ${x1} ${y1} L ${x1} ${midY} L ${x2} ${midY} L ${x2} ${y2}`,
+    class: `pt-edge pt-edge-branch pt-edge-${dir > 0 ? 'right' : 'left'}`,
+    d,
   });
   return path;
 }
@@ -838,6 +1036,14 @@ function zoomAt(clientX, clientY, factor) {
   applyView();
 }
 
+/**
+ * Show the whole drawing, with the main path still in the middle.
+ *
+ * The spine sits at x = 0, so the canvas is split in half around it: the
+ * branches that reach out to the left and to the right get the same amount of
+ * room. The scale is driven by whichever side reaches further, so nothing is
+ * cut off and the main path stays exactly in the centre.
+ */
 function fitToWindow() {
   if (!state.layout || !state.layout.records.length) return;
   const wrap = els.canvasWrap;
@@ -845,22 +1051,32 @@ function fitToWindow() {
   const height = wrap.clientHeight;
   if (!width || !height) return;
   const bounds = state.layout.bounds;
-  const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
+  const spineX = typeof state.layout.spineX === 'number' ? state.layout.spineX : 0;
+  const leftReach = Math.max(1, spineX - bounds.minX);
+  const rightReach = Math.max(1, bounds.maxX - spineX);
   const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
-  const scale = clamp(Math.min((width - 32) / contentWidth, (height - 32) / contentHeight), MIN_ZOOM, 1.6);
+  // The spine is in the middle, so both sides share the same half of the canvas.
+  const halfWidth = width / 2 - 16;
+  const scale = clamp(
+    Math.min(halfWidth / Math.max(leftReach, rightReach), (height - 32) / contentHeight),
+    MIN_ZOOM,
+    1.6,
+  );
   state.view.scale = scale;
-  state.view.tx = (width - contentWidth * scale) / 2 - bounds.minX * scale;
+  state.view.tx = width / 2 - spineX * scale;
   state.view.ty = (height - contentHeight * scale) / 2 - bounds.minY * scale;
   state.viewPinned = true;
   applyView();
 }
 
 /**
- * Put the root node in view at 100%.
+ * Put the root node in view at 100%, with the main path in the middle.
  *
  * A tree is read from its top down, so opening one starts at the question the
- * user asked, at natural size where every card is readable. The `适应窗口`
- * button still zooms the whole tree out on demand.
+ * user asked, at natural size where every card is readable. The main path
+ * runs down x = 0, so centring that line keeps the spine of the drawing
+ * dead centre no matter how far the branches reach to the left or right.
+ * The `适应窗口` button still zooms the whole tree out on demand.
  */
 function resetViewToRoot() {
   if (!state.layout || !state.layout.records.length) return;
@@ -870,8 +1086,9 @@ function resetViewToRoot() {
   if (!width || !height) return;
   const root = state.layout.records.find((record) => !record.parentId)
     ?? state.layout.records[0];
+  const spineX = typeof state.layout.spineX === 'number' ? state.layout.spineX : root.x;
   state.view.scale = 1;
-  state.view.tx = width / 2 - root.x;
+  state.view.tx = width / 2 - spineX;
   state.view.ty = Math.max(LABEL_PAD, height * 0.05) - root.y;
   applyView();
 }
@@ -892,20 +1109,54 @@ function onNodeKeydown(event, nodeId) {
   const record = state.layout.byId.get(nodeId);
   if (!record) return;
   let target = null;
-  if (key === 'ArrowDown') target = record.childIds[0] ?? null;
+  if (key === 'ArrowDown') target = childInLane(record);
   else if (key === 'ArrowUp') target = record.parentId ?? null;
-  else if (key === 'ArrowRight') {
-    const sibling = record.siblingIds[record.siblingIndex + 1];
-    target = sibling ?? null;
-  } else if (key === 'ArrowLeft') {
-    const sibling = record.siblingIds[record.siblingIndex - 1];
-    target = sibling ?? null;
-  }
+  else if (key === 'ArrowRight') target = neighbourInLane(record, 1);
+  else if (key === 'ArrowLeft') target = neighbourInLane(record, -1);
   if (target) {
     event.preventDefault();
     focusNode(target);
     els.srStatus.textContent = `节点：${state.layout.byId.get(target)?.node?.title ?? ''}`;
   }
+}
+
+/**
+ * The child straight below this node.
+ *
+ * On the main path that is the next strategy, so the arrow key walks down
+ * the spine; on a branch it is simply the first child.
+ */
+function childInLane(record) {
+  const layout = state.layout;
+  if (!layout || !record.childIds.length) return null;
+  let first = null;
+  for (const id of record.childIds) {
+    const child = layout.byId.get(id);
+    if (!child) continue;
+    if (child.lane === record.lane) return id;
+    if (!first) first = id;
+  }
+  return first;
+}
+
+/**
+ * The card next to this one in the drawing.
+ *
+ * The spine sits in the middle: the branches that do something open to the
+ * left, the branches that think open to the right. So the left and right
+ * arrow keys move between lanes instead of between siblings.
+ */
+function neighbourInLane(record, direction) {
+  const layout = state.layout;
+  if (!layout) return null;
+  let best = null;
+  for (const other of layout.records) {
+    if (other.id === record.id || other.depth !== record.depth) continue;
+    const delta = other.lane - record.lane;
+    if (!delta || Math.sign(delta) !== direction) continue;
+    if (!best || Math.abs(delta) < Math.abs(best.lane - record.lane)) best = other;
+  }
+  return best ? best.id : null;
 }
 
 /* ------------------------------------------------------------------ */
