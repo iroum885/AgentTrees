@@ -64,6 +64,48 @@
       <p id="tree-hint" class="toolbar-hint" role="status" aria-live="polite" hidden></p>
     </div>
 
+    <div id="tree-stats" class="tree-stats" role="group" aria-label="本回合统计" hidden>
+      <div class="stats-metrics">
+        <span class="stat">
+          <span class="stat-label">总耗时</span>
+          <span id="stat-duration" class="stat-value">—</span>
+        </span>
+        <span class="stat">
+          <span class="stat-label">总 token</span>
+          <span id="stat-tokens" class="stat-value">—</span>
+        </span>
+        <span class="stat" title="上下文被读取的 token，其中大部分命中缓存">
+          <span class="stat-label">上下文读取</span>
+          <span id="stat-cache" class="stat-value">—</span>
+        </span>
+        <span class="stat">
+          <span class="stat-label">动作</span>
+          <span id="stat-actions" class="stat-value">0</span>
+        </span>
+      </div>
+      <div class="stats-hotspots">
+        <button id="hot-token" class="hotspot hotspot-token" type="button" hidden>
+          <span class="hotspot-tag">最耗 token</span>
+          <span id="hot-token-label" class="hotspot-label">—</span>
+        </button>
+        <button id="hot-time" class="hotspot hotspot-time" type="button" hidden>
+          <span class="hotspot-tag">最耗时</span>
+          <span id="hot-time-label" class="hotspot-label">—</span>
+        </button>
+        <button id="btn-rank-token" class="rank-toggle" type="button" aria-expanded="false" aria-controls="rank-panel">token Top 10</button>
+        <button id="btn-rank-time" class="rank-toggle" type="button" aria-expanded="false" aria-controls="rank-panel">耗时 Top 10</button>
+      </div>
+
+      <div id="rank-panel" class="rank-panel" role="dialog" aria-label="排行榜" hidden>
+        <header class="rank-head">
+          <span id="rank-caption" class="rank-caption">耗时 Top 10</span>
+          <button id="rank-close" class="rank-close" type="button" aria-label="关闭排行榜">✕</button>
+        </header>
+        <ol id="rank-list" class="rank-list"></ol>
+        <p class="rank-foot">点任意一行，画布会跳到那张卡片。</p>
+      </div>
+    </div>
+
     <div id="canvas-wrap" class="canvas-wrap">
       <svg id="tree-svg" class="tree-svg" role="tree" aria-label="决策树画布" tabindex="0"></svg>
       <div id="canvas-overlay" class="canvas-overlay"></div>

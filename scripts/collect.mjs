@@ -27,6 +27,7 @@ import {
 } from './lib/store.mjs';
 import { readTranscriptSlice, extractReasoning } from './lib/transcript.mjs';
 import { partitionTurns, buildMechanicalTree } from './lib/tree.mjs';
+import { decorateTreeWithUsage } from './lib/usage.mjs';
 import { now, truncate, readJson, writeJsonAtomic } from './lib/util.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -151,6 +152,14 @@ function finalizeTurn(workspaceRoot, { sessionId, turnId }) {
   if (!turn) return;
   const tree = buildMechanicalTree(turn, { sessionId, origin: 'live', workspaceRoot });
   if (!tree) return;
+  // The token cost of every action is read from the runtime's session log, so
+  // the stored tree carries the numbers the viewer shows. A missing log only
+  // means the tree has no token information.
+  try {
+    decorateTreeWithUsage(tree, sessionId);
+  } catch {
+    /* the tree is still worth keeping without token numbers */
+  }
   writeTree(workspaceRoot, tree);
 }
 

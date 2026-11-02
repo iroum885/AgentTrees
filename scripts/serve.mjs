@@ -25,6 +25,7 @@ import {
   ensureDataLayout,
 } from './lib/store.mjs';
 import { partitionTurns } from './lib/tree.mjs';
+import { decorateTreeWithUsage } from './lib/usage.mjs';
 import { treeToHtml, treeToMarkdown } from './lib/export.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -101,6 +102,25 @@ function sendJson(res, status, body) {
     'Cache-Control': 'no-store',
   });
   res.end(text);
+}
+
+/**
+ * A tree with the token numbers of its actions.
+ *
+ * The stored tree was decorated when the collector wrote it, but the runtime
+ * only writes the usage of a model call after the call is finished. The log is
+ * therefore read again here, so the numbers the viewer shows are the final
+ * ones even for a turn that is already over.
+ */
+function treeWithUsage(workspace, turnId) {
+  const tree = readTree(workspace, turnId);
+  if (!tree) return null;
+  try {
+    decorateTreeWithUsage(tree, tree.sessionId);
+  } catch {
+    /* a tree without token numbers is still a tree */
+  }
+  return tree;
 }
 
 function readBody(req) {
@@ -271,7 +291,7 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { error: 'turn is required' });
         return;
       }
-      const tree = readTree(ws, turnId);
+      const tree = treeWithUsage(ws, turnId);
       if (!tree) {
         sendJson(res, 404, { error: 'tree not found' });
         return;
@@ -305,7 +325,7 @@ const server = http.createServer(async (req, res) => {
     if (route === '/api/export') {
       const turnId = url.searchParams.get('turn');
       const format = url.searchParams.get('format') || 'html';
-      const tree = readTree(ws, turnId);
+      const tree = treeWithUsage(ws, turnId);
       if (!tree) {
         sendJson(res, 404, { error: 'tree not found' });
         return;
@@ -421,7 +441,7 @@ function poll() {
     seenTrees.set(turn.turnId, stamp);
     // The first sweep only seeds the cache; the page already loads the trees.
     if (firstPoll) continue;
-    const tree = readTree(currentWorkspace, turn.turnId);
+    const tree = treeWithUsage(currentWorkspace, turn.turnId);
     if (tree) broadcast('tree', { turnId: turn.turnId, tree });
   }
   firstPoll = false;

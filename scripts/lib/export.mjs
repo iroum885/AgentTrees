@@ -106,6 +106,32 @@ function durationOf(node) {
   return formatDuration(node?.durationMs);
 }
 
+/** The token cost of a node, rendered the way the node badge shows it. */
+function tokensOf(node) {
+  const tokens = node?.tokens;
+  if (!tokens) return '';
+  const parts = [];
+  if (typeof tokens.backfill === 'number' && tokens.backfill > 0) parts.push(`回填 ${tokens.backfill}`);
+  if (typeof tokens.gen === 'number' && tokens.gen > 0) parts.push(`生成 ${tokens.gen}`);
+  if (typeof tokens.think === 'number' && tokens.think > 0) parts.push(`思考 ${tokens.think}`);
+  if (!parts.length) return '';
+  return `${parts.join(' · ')}（合计 ${tokens.total ?? 0}）`;
+}
+
+/** The totals of the whole turn. */
+function totalsOf(tree) {
+  const totals = tree?.totals;
+  if (!totals) return '';
+  const tokens = totals.tokens ?? {};
+  const parts = [
+    `总耗时 ${formatDuration(totals.durationMs) || '—'}`,
+    `总 token ${tokens.billable ?? 0}`,
+    `上下文读取 ${tokens.cacheRead ?? 0}`,
+    `动作 ${tokens.actionCount ?? 0}`,
+  ];
+  return parts.join(' · ');
+}
+
 /** The one-line full command of an execution node. */
 function commandOf(node) {
   if (node?.type !== 'execution') return '';
@@ -124,6 +150,10 @@ export function treeToMarkdown(tree) {
   lines.push(`- 来源: ${tree.origin === 'history' ? '历史回填' : '实时采集'}`);
   lines.push(`- 时间: ${formatTime(tree.ts) || '-'}`);
   lines.push(`- 节点数: ${(tree.nodes ?? []).length}`);
+  const totals = totalsOf(tree);
+  if (totals) {
+    lines.push(`- 统计: ${totals}`);
+  }
   lines.push('');
 
   const walk = (nodes, depth) => {
@@ -145,8 +175,34 @@ export function treeToMarkdown(tree) {
       if (duration) {
         lines.push(`${'  '.repeat(depth)}  > 耗时：${duration}`);
       }
+      const tokens = tokensOf(node);
+      if (tokens) {
+        lines.push(`${'  '.repeat(depth)}  > token：${tokens}`);
+      }
+      if (node.intent) {
+        lines.push(`${'  '.repeat(depth)}  > 决策意图：${node.intent}`);
+      }
+      if (node.why) {
+        lines.push(`${'  '.repeat(depth)}  > 为什么：${node.why}`);
+      }
+      if (node.basis) {
+        lines.push(`${'  '.repeat(depth)}  > 决定性信息（${node.basis.label ?? '依据'}）：${node.basis.text}`);
+      }
       if (node.summary && node.summary !== node.title && !command) {
         lines.push(`${'  '.repeat(depth)}  > ${truncate(node.summary, 300)}`);
+      }
+      // The actions of a strategy layer, each with the reason it was taken.
+      if (Array.isArray(node.actions) && node.actions.length) {
+        lines.push(`${'  '.repeat(depth)}  > 产生的动作：`);
+        for (const action of node.actions) {
+          lines.push(`${'  '.repeat(depth)}    - ${action.label ?? '执行'}：${action.title ?? ''}`);
+          if (action.why) {
+            lines.push(`${'  '.repeat(depth)}      > 为什么：${action.why}`);
+          }
+          if (action.basis) {
+            lines.push(`${'  '.repeat(depth)}      > 决定性信息（${action.basis.label ?? '依据'}）：${action.basis.text}`);
+          }
+        }
       }
       walk(node.children ?? [], depth + 1);
     }
@@ -177,15 +233,38 @@ export function treeToHtml(tree) {
       const durationBlock = duration
         ? `<p class="dur"><span class="dur-label">耗时</span>${escapeHtml(duration)}</p>`
         : '';
+      const tokenText = tokensOf(node);
+      const tokenBlock = tokenText
+        ? `<p class="tok"><span class="tok-label">token</span>${escapeHtml(tokenText)}</p>`
+        : '';
       const detail = node.detail && !command
         ? `<pre>${escapeHtml(node.detail)}</pre>`
         : '';
       const output = node.output ? `<pre class="out">${escapeHtml(node.output)}</pre>` : '';
+      const intentBlock = node.intent
+        ? `<p class="intent"><span class="intent-label">决策意图</span>${escapeHtml(node.intent)}</p>`
+        : '';
+      const whyBlock = node.why
+        ? `<p class="why"><span class="why-label">为什么</span>${escapeHtml(node.why)}</p>`
+        : '';
+      const basisBlock = node.basis
+        ? `<p class="basis"><span class="basis-label">决定性信息</span>${escapeHtml(node.basis.text)}`
+          + `<span class="basis-src">${escapeHtml(node.basis.label ?? '依据')}</span></p>`
+        : '';
       const actionList = Array.isArray(node.actions) && node.actions.length
         ? '<p class="acts-label">产生的动作</p><ul class="acts">'
           + node.actions
-            .map((action) => `<li><span class="act-kind">${escapeHtml(action.label ?? '')}</span>`
-              + `<span class="act-title">${escapeHtml(action.title ?? '')}</span></li>`)
+            .map((action) => `<li>`
+              + `<div class="act-head"><span class="act-kind">${escapeHtml(action.label ?? '')}</span>`
+              + `<span class="act-title">${escapeHtml(action.title ?? '')}</span></div>`
+              + (action.why
+                ? `<p class="why"><span class="why-label">为什么</span>${escapeHtml(action.why)}</p>`
+                : '')
+              + (action.basis
+                ? `<p class="basis"><span class="basis-label">决定性信息</span>${escapeHtml(action.basis.text)}`
+                  + `<span class="basis-src">${escapeHtml(action.basis.label ?? '依据')}</span></p>`
+                : '')
+              + '</li>')
             .join('')
           + '</ul>'
         : '';
@@ -202,6 +281,10 @@ export function treeToHtml(tree) {
           `</summary>` +
           commandBlock +
           durationBlock +
+          tokenBlock +
+          intentBlock +
+          whyBlock +
+          basisBlock +
           (node.summary && node.summary !== node.title && !command
             ? `<p class="sum">${escapeHtml(node.summary)}</p>` : '') +
           detail +
@@ -223,7 +306,7 @@ export function treeToHtml(tree) {
 <style>
   :root { color-scheme: light dark; }
   body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; line-height: 1.6; background: #f7f8fa; color: #1c1e21; }
-  @media (prefers-color-scheme: dark) { body { background: #16181c; color: #e6e6e6; } pre { background: #0e1013 !important; } details { background: #1d2026 !important; border-color: #2b2f37 !important; } }
+  @media (prefers-color-scheme: dark) { body { background: #16181c; color: #e6e6e6; } pre { background: #0e1013 !important; } details { background: #1d2026 !important; border-color: #2b2f37 !important; } ul.acts li { border-color: #2b2f37 !important; } }
   header { max-width: 1000px; margin: 0 auto 20px; }
   h1 { font-size: 20px; margin: 0 0 8px; }
   .meta { font-size: 12px; opacity: .65; }
@@ -243,13 +326,20 @@ export function treeToHtml(tree) {
   @media (prefers-color-scheme: dark) { .cmd code { background: #22263a !important; } }
   .dur { margin: 6px 0 0; font-size: 12px; opacity: .6; display: flex; gap: 8px; align-items: baseline; }
   .dur-label { font-size: 10px; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; }
+  .tok { margin: 6px 0 0; font-size: 12px; opacity: .75; display: flex; gap: 8px; align-items: baseline; }
+  .tok-label { font-size: 10px; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; }
+  .totals { margin: 0 0 16px; font-size: 12px; opacity: .75; }
   pre { white-space: pre-wrap; word-break: break-word; background: #f2f4f7; padding: 10px; border-radius: 6px; font-size: 12px; overflow-x: auto; }
   pre.out { background: #eef6ff; }
   .acts-label { margin: 10px 0 4px; font-size: 11px; opacity: .6; }
-  ul.acts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-  ul.acts li { display: flex; gap: 8px; align-items: baseline; font-size: 12px; }
+  ul.acts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  ul.acts li { border: 1px solid #e2e5ea; border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+  .act-head { display: flex; gap: 8px; align-items: baseline; }
   .act-kind { flex: none; font-size: 10px; border: 1px solid currentColor; border-radius: 999px; padding: 0 7px; opacity: .8; }
   .act-title { word-break: break-word; }
+  .intent, .why, .basis { margin: 6px 0 0; display: flex; gap: 8px; align-items: baseline; font-size: 12px; line-height: 1.6; }
+  .intent-label, .why-label, .basis-label { flex: none; font-size: 10px; border: 1px solid currentColor; border-radius: 999px; padding: 0 7px; opacity: .75; }
+  .basis-src { flex: none; font-size: 10px; opacity: .6; border: 1px dashed currentColor; border-radius: 999px; padding: 0 7px; }
   details.node.act-read > summary .label { color: #1d4ed8; }
   details.node.act-write > summary .label { color: #15803d; }
   details.node.act-edit > summary .label { color: #0f766e; }
@@ -269,6 +359,7 @@ export function treeToHtml(tree) {
 <header>
   <h1>${escapeHtml(tree.question ?? '(无提问)')}</h1>
   <div class="meta">回合 <code>${escapeHtml(tree.turnId)}</code> · 会话 <code>${escapeHtml(tree.sessionId ?? '-')}</code> · ${escapeHtml(tree.origin === 'history' ? '历史回填' : '实时采集')} · ${escapeHtml(formatTime(tree.ts) || '-')}</div>
+${totalsOf(tree) ? `  <div class="totals">${escapeHtml(totalsOf(tree))}</div>` : ''}
 </header>
 <div class="tree">
 ${blocks.join('\n')}

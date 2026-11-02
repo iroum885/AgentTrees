@@ -7,7 +7,14 @@ import {
   toolAction,
   toolLabel,
 } from './labels.mjs';
-
+import {
+  actionTargets,
+  deriveBasis,
+  deriveWhy,
+  extractOutputText,
+  splitLines,
+  splitSentences,
+} from './evidence.mjs';
 /**
  * Tree construction.
  *
@@ -171,6 +178,10 @@ export function extractAgentQuestion(input) {
  * message (the `thinking` block and the `text` block of the same reply), so
  * they are merged into a single unit and become one strategy node instead of
  * two look-alike twins.
+ *
+ * The channel of every part is kept: the `text` channel is what the agent
+ * said out loud before acting, which is its own concise statement of intent,
+ * while the `thinking` channel is the long reasoning behind it.
  */
 function buildUnits(events) {
   const units = [];
@@ -185,7 +196,10 @@ function buildUnits(events) {
       && prev.ts !== null
       && ts === prev.ts) {
       prev.events.push(event);
-      prev.texts.push(event.data?.text ?? '');
+      prev.parts.push({
+        channel: event.data?.channel ?? 'text',
+        text: event.data?.text ?? '',
+      });
       continue;
     }
     units.push({
@@ -193,10 +207,28 @@ function buildUnits(events) {
       ts,
       event,
       events: [event],
-      texts: event.kind === 'reasoning' ? [event.data?.text ?? ''] : [],
+      parts: event.kind === 'reasoning'
+        ? [{ channel: event.data?.channel ?? 'text', text: event.data?.text ?? '' }]
+        : [],
     });
   }
   return units;
+}
+
+/** The spoken part of a reasoning unit: the agent's own words, before acting. */
+function spokenText(parts) {
+  return parts
+    .filter((part) => part.channel !== 'thinking' && part.text && part.text.trim())
+    .map((part) => part.text.trim())
+    .join('\n');
+}
+
+/** The thought part of a reasoning unit: the reasoning behind the action. */
+function thoughtText(parts) {
+  return parts
+    .filter((part) => part.channel === 'thinking' && part.text && part.text.trim())
+    .map((part) => part.text.trim())
+    .join('\n');
 }
 
 /**
@@ -331,6 +363,10 @@ export function buildMechanicalTree(turn, {
   const strategyStack = [];
   const executionByToolUseId = new Map();
   const strategyNodes = [];
+  /** What the agent thought and said for each strategy node. */
+  const strategyContext = new Map();
+  /** The subject of each execution: the strings that identify it. */
+  const targetsByNodeId = new Map();;
 
   for (let i = 0; i < units.length; i += 1) {
     const unit = units[i];
@@ -339,8 +375,17 @@ export function buildMechanicalTree(turn, {
     const ts = stamps[i];
     switch (unit.kind) {
       case 'reasoning': {
-        const text = unit.texts.filter((part) => part && part.trim()).join('\n\n');
+        const parts = unit.parts ?? [];
+        const text = parts
+          .map((part) => (part.text ?? '').trim())
+          .filter(Boolean)
+          .join('\n\n');
         if (!text.trim()) break;
+        // The two channels are kept apart: the spoken part is the one-line
+        // intent the agent stated before acting, the thought part is the long
+        // reasoning it used to pick the action.
+        const thinking = thoughtText(parts);
+        const spoken = spokenText(parts);
         const node = addNode({
           id: nextId(),
           parentId: lastStrategyId ?? questionNode.id,
@@ -356,6 +401,7 @@ export function buildMechanicalTree(turn, {
           source: unit.events[0].data?.source ?? null,
           sourceTs: unit.events[0].data?.sourceTs ?? null,
         }, { kind: 'reasoning' });
+        strategyContext.set(node.id, { thinking, spoken });
         for (const executionId of pendingExecutionIds) {
           const execution = executionByToolUseId.get(executionId);
           if (execution) execution.parentId = node.id;
@@ -430,6 +476,9 @@ export function buildMechanicalTree(turn, {
           durationMs: null,
         }, { closeTs });
         if (data.toolUseId) executionByToolUseId.set(data.toolUseId, node);
+        // Remember what the action is about: its paths, patterns and names.
+        // Those strings are later used to find the line that decided it.
+        targetsByNodeId.set(node.id, actionTargets(tool, input, root));
         pendingExecutionIds.push(node.id);
         pendingPermissionId = null;
         break;
@@ -546,6 +595,19 @@ export function buildMechanicalTree(turn, {
     if (!childrenByParent.has(key)) childrenByParent.set(key, []);
     childrenByParent.get(key).push(node);
   }
+
+  /** Where a node sits in the timeline: earlier means it ran before. */
+  const orderIndex = new Map(nodes.map((node, index) => [node.id, index]));
+  const questionLines = splitLines(userMessage.text);
+
+  /** The output of an execution, as the lines that can point at a later one. */
+  const sourceOfExecution = (node) => ({
+    kind: 'execution',
+    label: '前序执行结果',
+    nodeId: node.id,
+    lines: splitLines(extractOutputText(node.output)),
+  });
+
   for (const node of strategyNodes) {
     const children = childrenByParent.get(node.id) ?? [];
     const executions = children.filter((child) => child.type === 'execution');
@@ -553,10 +615,48 @@ export function buildMechanicalTree(turn, {
     // `actions` keeps the concrete ones for the detail panel.
     const labels = executions.map((child) => child.action ?? toolLabel(child.tool));
     node.title = strategyTitle(labels, node.detail);
+
+    const context = strategyContext.get(node.id) ?? { thinking: '', spoken: '' };
+    const intent = splitSentences(context.spoken)[0] ?? '';
+    if (intent.trim()) node.intent = truncate(intent, 160);
+
+    // Everything that ran before this strategy is the evidence it started
+    // from: the outputs of the previous layer, closest one first.
+    const ownIndex = orderIndex.get(node.id) ?? 0;
+    const earlierExecutions = nodes
+      .filter((candidate) => candidate.type === 'execution'
+        && (orderIndex.get(candidate.id) ?? 0) < ownIndex)
+      .reverse();
+
+    for (const child of executions) {
+      const targets = targetsByNodeId.get(child.id) ?? [];
+      const why = deriveWhy({
+        thinking: context.thinking,
+        spoken: context.spoken,
+        targets,
+      });
+      const sources = [
+        // What the sibling actions of this very layer already revealed.
+        ...executions
+          .filter((sibling) => (orderIndex.get(sibling.id) ?? 0) < (orderIndex.get(child.id) ?? 0))
+          .reverse()
+          .map(sourceOfExecution),
+        // What the previous layers revealed.
+        ...earlierExecutions.map(sourceOfExecution),
+        // And what the user asked for.
+        { kind: 'question', label: '用户提问', nodeId: questionNode.id, lines: questionLines },
+      ];
+      const basis = deriveBasis({ targets, sources });
+      if (why) child.why = why;
+      if (basis) child.basis = basis;
+    }
+
     node.actions = executions.map((child) => ({
       label: child.action ?? toolLabel(child.tool),
       title: child.title ?? '',
       tool: child.tool ?? '',
+      why: child.why ?? '',
+      basis: child.basis ?? null,
     }));
   }
 

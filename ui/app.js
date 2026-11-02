@@ -86,6 +86,10 @@ const state = {
   selectedNodeId: null,
   layout: null,
   nodeEls: new Map(),
+  /** The cards that cost the most tokens and the most time. */
+  hotspots: { tokenId: null, timeId: null },
+  /** Which leaderboard is open: 'time' | 'token' | null. */
+  rankMode: null,
   filterText: '',
   originLive: true,
   originHistory: true,
@@ -139,6 +143,47 @@ function formatDuration(ms) {
   return `${minutes}分${String(seconds).padStart(2, '0')}秒`;
 }
 
+/**
+ * Render a token count the way a card badge shows it: 812 / 1.7k / 1.24M.
+ */
+function formatTokens(count) {
+  if (typeof count !== 'number' || !Number.isFinite(count) || count <= 0) return '';
+  if (count < 1000) return String(Math.round(count));
+  if (count < 1000000) {
+    const value = count / 1000;
+    return `${value < 10 ? value.toFixed(1) : Math.round(value)}k`;
+  }
+  return `${(count / 1000000).toFixed(2)}M`;
+}
+
+/**
+ * The token line of a card.
+ *
+ * An action shows what it cost: the tokens it filled into the context and the
+ * tokens the model spent writing it. A strategy shows the thinking it took.
+ */
+function tokenBadgeText(node) {
+  const tokens = node?.tokens;
+  if (!tokens) return '';
+  if (typeof tokens.total === 'number' && tokens.total > 0) {
+    return `${formatTokens(tokens.total)} tok`;
+  }
+  return '';
+}
+
+/** The long form of a card's token cost, used in the tooltip and the panel. */
+function tokenDetailText(node) {
+  const tokens = node?.tokens;
+  if (!tokens) return '';
+  const parts = [];
+  if (typeof tokens.backfill === 'number' && tokens.backfill > 0) parts.push(`回填 ${tokens.backfill}`);
+  if (typeof tokens.gen === 'number' && tokens.gen > 0) parts.push(`生成 ${tokens.gen}`);
+  if (typeof tokens.think === 'number' && tokens.think > 0) parts.push(`思考 ${tokens.think}`);
+  if (!parts.length) return '';
+  const total = parts.reduce((sum, part) => sum + Number(part.split(' ')[1]), 0);
+  return `${parts.join(' · ')}（合计 ${total}）`;
+}
+
 function errorMessage(err) {
   if (!err) return '未知错误';
   if (typeof err === 'string') return err;
@@ -176,6 +221,24 @@ async function fetchJSON(url, options) {
     throw err;
   }
   return body;
+}
+
+/**
+ * Fetch with a deadline.
+ *
+ * A request can hang when the browser's connection pool for this origin is
+ * busy — the viewer keeps a live SSE stream open, and several open tabs add
+ * up. A tree that never arrives would leave the canvas empty, so the request
+ * is given a deadline and retried instead of waiting forever.
+ */
+async function fetchJSONWithTimeout(url, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchJSON(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function copyText(text) {
@@ -884,15 +947,34 @@ function buildNodeElement(record) {
   durationText.textContent = duration ? `耗时 ${duration}` : '耗时 —';
   group.appendChild(durationText);
 
+  // The token cost of the card, on the other side of the same line.
+  const tokenText = tokenBadgeText(node);
+  if (tokenText) {
+    const badge = svgEl('text', {
+      class: 'pt-node-tokens',
+      x: x0 + NODE_W - TITLE_PAD,
+      y: y0 + NODE_H - 10,
+      'text-anchor': 'end',
+    });
+    badge.textContent = tokenText;
+    group.appendChild(badge);
+  }
+
+  const tokenDetail = tokenDetailText(node);
   const tooltip = svgEl('title', {});
-  tooltip.textContent = duration
-    ? `${action ? action.label : meta.label}：${node.title ?? ''}（耗时 ${duration}）`
-    : `${action ? action.label : meta.label}：${node.title ?? ''}`;
+  const head = `${action ? action.label : meta.label}：${node.title ?? ''}`;
+  tooltip.textContent = [head, duration ? `耗时 ${duration}` : '', tokenDetail]
+    .filter(Boolean)
+    .join('（');
   group.appendChild(tooltip);
 
   if (node.selected === false) group.classList.add('is-unselected');
   if (nodeHasError(node)) group.classList.add('is-error');
   if (record.id === state.selectedNodeId) group.classList.add('is-selected');
+  // The two most expensive cards of the turn are marked, so the eye finds
+  // them without reading every number.
+  if (state.hotspots.tokenId === record.id) group.classList.add('is-hot-token');
+  if (state.hotspots.timeId === record.id) group.classList.add('is-hot-time');
 
   group.addEventListener('click', (event) => {
     event.stopPropagation();
@@ -948,6 +1030,9 @@ function buildEdgeElement(parent, child) {
 function renderCanvas() {
   els.svg.replaceChildren();
   state.nodeEls = new Map();
+  renderStats();
+  // An open leaderboard keeps its numbers live while the turn grows.
+  renderRankPanel();
 
   if (!state.selectedTurnId) {
     showCanvasMessage(
@@ -1005,6 +1090,225 @@ function renderCanvas() {
   }
 
   applyView();
+}
+
+/* ------------------------------------------------------------------ */
+/* turn totals and hotspots                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The two cards that cost the most.
+ *
+ * One is picked by the tokens it spent, one by the time it took. The question
+ * card is left out: it is the prompt, not an action of the agent.
+ */
+function computeHotspots(tree) {
+  const hotspots = { tokenId: null, timeId: null };
+  let bestToken = 0;
+  let bestTime = 0;
+  for (const node of tree?.nodes || []) {
+    if (!node || node.type === 'question') continue;
+    const tokens = typeof node.tokens?.total === 'number' ? node.tokens.total : 0;
+    if (tokens > bestToken) {
+      bestToken = tokens;
+      hotspots.tokenId = node.id;
+    }
+    const duration = typeof node.durationMs === 'number' ? node.durationMs : 0;
+    if (duration > bestTime) {
+      bestTime = duration;
+      hotspots.timeId = node.id;
+    }
+  }
+  return hotspots;
+}
+
+/** The title of a node, short enough for a chip. */
+function nodeShortTitle(node) {
+  const title = String(node?.title ?? '').replace(/\s+/g, ' ').trim();
+  if (title.length <= 26) return title || '(无标题)';
+  return `${title.slice(0, 25)}…`;
+}
+
+/**
+ * The summary bar above the canvas.
+ *
+ * It carries what the whole turn cost — time and tokens — and the two cards
+ * that stand out. Both are buttons: clicking one jumps to that card.
+ */
+function renderStats() {
+  const bar = els.treeStats;
+  if (!bar) return;
+  const totals = state.tree?.totals ?? null;
+  const nodes = Array.isArray(state.tree?.nodes) ? state.tree.nodes : [];
+  const hasTokens = nodes.some((node) => node?.tokens?.total > 0);
+
+  if (!totals && !hasTokens) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+
+  const tokenTotals = totals?.tokens ?? {};
+  els.statDuration.textContent = formatDuration(totals?.durationMs) || '—';
+  els.statTokens.textContent = formatTokens(tokenTotals.billable) || '—';
+  els.statCache.textContent = formatTokens(tokenTotals.cacheRead) || '—';
+  els.statActions.textContent = String(tokenTotals.actionCount ?? 0);
+
+  const tokenNode = state.hotspots.tokenId ? state.layout?.byId.get(state.hotspots.tokenId)?.node : null;
+  const timeNode = state.hotspots.timeId ? state.layout?.byId.get(state.hotspots.timeId)?.node : null;
+
+  const tokenTotal = tokenNode?.tokens?.total ?? 0;
+  if (tokenNode && tokenTotal > 0) {
+    els.hotToken.hidden = false;
+    els.hotTokenLabel.textContent = `${nodeShortTitle(tokenNode)} · ${formatTokens(tokenTotal)} tok`;
+    els.hotToken.title = `token 耗费最大的卡片：${tokenNode.title ?? ''}（${tokenTotal} token）`;
+    els.hotToken.dataset.nodeId = tokenNode.id;
+  } else {
+    els.hotToken.hidden = true;
+    els.hotTokenLabel.textContent = '—';
+    els.hotToken.dataset.nodeId = '';
+  }
+
+  const timeMs = timeNode?.durationMs ?? 0;
+  if (timeNode && timeMs > 0) {
+    els.hotTime.hidden = false;
+    els.hotTimeLabel.textContent = `${nodeShortTitle(timeNode)} · ${formatDuration(timeMs)}`;
+    els.hotTime.title = `耗时最长的卡片：${timeNode.title ?? ''}（${formatDuration(timeMs)}）`;
+    els.hotTime.dataset.nodeId = timeNode.id;
+  } else {
+    els.hotTime.hidden = true;
+    els.hotTimeLabel.textContent = '—';
+    els.hotTime.dataset.nodeId = '';
+  }
+}
+
+/**
+ * The ten most expensive cards of the turn.
+ *
+ * `mode` decides what is ranked: the tokens an action spent, or the time it
+ * took. The question card is left out — it is the prompt, not an action.
+ */
+function computeRanking(mode) {
+  const nodes = Array.isArray(state.tree?.nodes) ? state.tree.nodes : [];
+  const value = (node) => {
+    if (mode === 'token') {
+      const total = node?.tokens?.total;
+      return typeof total === 'number' ? total : 0;
+    }
+    const duration = node?.durationMs;
+    return typeof duration === 'number' ? duration : 0;
+  };
+  return nodes
+    .filter((node) => node && node.type !== 'question')
+    .map((node) => ({ node, value: value(node) }))
+    .filter((row) => row.value > 0)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 10);
+}
+
+/** The Chinese class of a node, used as the label of a rank row. */
+function rankLabel(node) {
+  const action = node?.actionKind ? actionMeta(node) : null;
+  return action ? action.label : (TYPE_META[node?.type]?.label ?? '节点');
+}
+
+/**
+ * The leaderboard panel.
+ *
+ * Every row is a button: clicking it jumps to that card, the same way the
+ * two hotspot chips do.
+ */
+function renderRankPanel() {
+  const panel = els.rankPanel;
+  if (!panel) return;
+  const mode = state.rankMode;
+  if (!mode) {
+    panel.hidden = true;
+    els.rankToken?.setAttribute('aria-expanded', 'false');
+    els.rankTime?.setAttribute('aria-expanded', 'false');
+    return;
+  }
+
+  panel.hidden = false;
+  els.rankCaption.textContent = mode === 'token' ? 'token 耗费 Top 10' : '耗时 Top 10';
+  els.rankToken?.setAttribute('aria-expanded', mode === 'token' ? 'true' : 'false');
+  els.rankTime?.setAttribute('aria-expanded', mode === 'time' ? 'true' : 'false');
+
+  const list = els.rankList;
+  list.replaceChildren();
+  const rows = computeRanking(mode);
+  if (!rows.length) {
+    list.appendChild(el('li', 'rank-empty', '这一回合还没有可排名的卡片'));
+    return;
+  }
+
+  rows.forEach((row, index) => {
+    const item = el('li', 'rank-item');
+    const button = el('button', 'rank-row');
+    button.type = 'button';
+    button.dataset.nodeId = row.node.id;
+    button.appendChild(el('span', 'rank-no', String(index + 1)));
+    button.appendChild(el('span', 'rank-kind', rankLabel(row.node)));
+    button.appendChild(el('span', 'rank-title', nodeShortTitle(row.node)));
+    button.appendChild(el('span', 'rank-value',
+      mode === 'token' ? `${formatTokens(row.value)} tok` : formatDuration(row.value)));
+    button.title = row.node.title ?? '';
+    button.addEventListener('click', () => {
+      jumpToNode(row.node.id);
+      closeRankPanel();
+    });
+    item.appendChild(button);
+    list.appendChild(item);
+  });
+}
+
+/** Open one of the two leaderboards, or close it when it is already open. */
+function toggleRankPanel(mode) {
+  state.rankMode = state.rankMode === mode ? null : mode;
+  renderRankPanel();
+}
+
+/** Close the leaderboard. */
+function closeRankPanel() {
+  if (!state.rankMode) return;
+  state.rankMode = null;
+  renderRankPanel();
+}
+
+/**
+ * Jump to a card: select it, centre it and let it flash.
+ *
+ * The view is pinned afterwards, so a live update does not pull the camera
+ * back while the user is looking at that card.
+ */
+function jumpToNode(nodeId) {
+  if (!nodeId) return;
+  const record = state.layout?.byId.get(nodeId);
+  if (!record) return;
+  selectNode(nodeId);
+
+  const wrap = els.canvasWrap;
+  const width = wrap?.clientWidth || 0;
+  const height = wrap?.clientHeight || 0;
+  if (width && height) {
+    const scale = clamp(state.view.scale < 0.7 ? 0.9 : state.view.scale, MIN_ZOOM, MAX_ZOOM);
+    state.view.scale = scale;
+    state.view.tx = width / 2 - record.x * scale;
+    state.view.ty = height / 2 - (record.y + NODE_H / 2) * scale;
+    state.viewPinned = true;
+    applyView();
+  }
+
+  const group = state.nodeEls.get(nodeId);
+  if (group && typeof group.focus === 'function') group.focus({ preventScroll: true });
+  if (group) {
+    group.classList.remove('is-flash');
+    // Restart the animation even when the card was already marked.
+    void group.getBoundingClientRect();
+    group.classList.add('is-flash');
+    setTimeout(() => group.classList.remove('is-flash'), 1800);
+  }
+  els.srStatus.textContent = `已跳转到卡片：${record.node?.title ?? ''}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1202,6 +1506,57 @@ function buildCopyButton(label, text) {
   return button;
 }
 
+/**
+ * The reason an action was taken.
+ *
+ * The sentence is read out of the recorded reasoning of the layer that ran
+ * the action - it is the agent's own words, not a fresh explanation.
+ */
+function buildWhyLine(why) {
+  const row = el('p', 'detail-why');
+  row.appendChild(el('span', 'detail-why-label', '为什么'));
+  row.appendChild(el('span', 'detail-why-text', why));
+  return row;
+}
+
+/**
+ * The piece of information that decided the action.
+ *
+ * The badge names where that line came from. When the source is a node of
+ * the tree on screen it becomes a link that jumps there.
+ */
+function buildBasisLine(basis) {
+  const row = el('p', 'detail-basis');
+  row.appendChild(el('span', 'detail-basis-label', '决定性信息'));
+  row.appendChild(el('span', 'detail-basis-text', basis?.text || '记录中没有直接对应的线索'));
+  const label = basis?.label || '依据';
+  if (basis?.nodeId && state.layout?.byId.has(basis.nodeId)) {
+    const link = el('button', 'detail-basis-source is-link', label);
+    link.type = 'button';
+    link.title = '跳转到这条线索的来源节点';
+    link.addEventListener('click', () => gotoNode(basis.nodeId));
+    row.appendChild(link);
+  } else {
+    row.appendChild(el('span', 'detail-basis-source', label));
+  }
+  return row;
+}
+
+/** The one-line intent the agent stated before it started a layer. */
+function buildIntentLine(intent) {
+  const row = el('p', 'detail-intent');
+  row.appendChild(el('span', 'detail-intent-label', '决策意图'));
+  row.appendChild(el('span', 'detail-intent-text', intent));
+  return row;
+}
+
+/** Select a node and put the focus on it in the drawing. */
+function gotoNode(nodeId) {
+  if (!nodeId) return;
+  if (state.selectedNodeId !== nodeId) selectNode(nodeId);
+  focusNode(nodeId);
+}
+
 function renderDetail() {
   const body = els.detailBody;
   body.replaceChildren();
@@ -1232,6 +1587,18 @@ function renderDetail() {
   if (node.action) fields.appendChild(buildField('分类', node.action));
   fields.appendChild(buildField('状态', node.status ? (STATUS_LABEL[node.status] || node.status) : '—'));
   fields.appendChild(buildField('耗时', formatDuration(node.durationMs) || '—'));
+  if (node.tokens) {
+    if (typeof node.tokens.backfill === 'number') {
+      fields.appendChild(buildField('回填 token', formatTokens(node.tokens.backfill) || '0'));
+    }
+    if (typeof node.tokens.gen === 'number') {
+      fields.appendChild(buildField('生成 token', formatTokens(node.tokens.gen) || '0'));
+    }
+    if (typeof node.tokens.think === 'number') {
+      fields.appendChild(buildField('思考 token', formatTokens(node.tokens.think) || '0'));
+    }
+    fields.appendChild(buildField('合计 token', formatTokens(node.tokens.total) || '0'));
+  }
   fields.appendChild(buildField('时间', formatTime(node.ts) || '—'));
   if (node.channel) {
     fields.appendChild(buildField('内容', node.channel === 'thinking' ? '思考' : '文本'));
@@ -1240,6 +1607,10 @@ function renderDetail() {
   body.appendChild(fields);
 
   if (type === 'execution') {
+    // The reason this action ran, and the line that pointed at it.
+    if (node.why) body.appendChild(buildWhyLine(node.why));
+    if (node.basis) body.appendChild(buildBasisLine(node.basis));
+
     // An execution node shows one complete line: the full command.
     const command = node.command || node.detail || '';
     body.appendChild(el('h4', 'detail-section-title', '完整命令'));
@@ -1251,19 +1622,27 @@ function renderDetail() {
       body.appendChild(el('pre', 'detail-pre detail-output', node.output));
     }
   } else if (type === 'scheme') {
+    // The intent the agent stated before this layer started.
+    if (node.intent) body.appendChild(buildIntentLine(node.intent));
+
     // A strategy node shows the strategy text as it was written.
     body.appendChild(el('h4', 'detail-section-title', '策略原文'));
     body.appendChild(el('pre', 'detail-pre', node.detail || '(无内容)'));
     body.appendChild(buildCopyButton('复制策略原文', node.detail || ''));
 
-    // The concrete actions this layer produced.
+    // The concrete actions this layer produced, each with the reason it was
+    // taken and the information that decided it.
     if (Array.isArray(node.actions) && node.actions.length) {
       body.appendChild(el('h4', 'detail-section-title', '产生的动作'));
       const list = el('ul', 'detail-actions');
       for (const action of node.actions) {
         const item = el('li', 'detail-action');
-        item.appendChild(el('span', 'detail-action-kind', action.label || '执行'));
-        item.appendChild(el('span', 'detail-action-title', action.title || ''));
+        const head = el('div', 'detail-action-head');
+        head.appendChild(el('span', 'detail-action-kind', action.label || '执行'));
+        head.appendChild(el('span', 'detail-action-title', action.title || ''));
+        item.appendChild(head);
+        if (action.why) item.appendChild(buildWhyLine(action.why));
+        if (action.basis) item.appendChild(buildBasisLine(action.basis));
         list.appendChild(item);
       }
       body.appendChild(list);
@@ -1381,6 +1760,7 @@ function onWorkspaceChanged(data) {
   state.tree = null;
   state.treeError = null;
   state.layout = null;
+  state.hotspots = { tokenId: null, timeId: null };
   state.followLatest = true;
 
   renderSidebar();
@@ -1441,11 +1821,30 @@ async function loadTree() {
   const turnId = state.selectedTurnId;
   if (!turnId) return;
   try {
-    const tree = await fetchJSON(`/api/tree?turn=${encodeURIComponent(turnId)}`);
-    if (state.selectedTurnId !== turnId) return;
+    // The tree can be big; if the request stalls it is tried again instead of
+    // leaving an empty canvas behind.
+    let tree = null;
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        tree = await fetchJSONWithTimeout(`/api/tree?turn=${encodeURIComponent(turnId)}`);
+        break;
+      } catch (err) {
+        lastError = err;
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 700 * (attempt + 1)));
+      }
+    }
+    if (!tree) throw lastError ?? new Error('tree not loaded');
+    if (state.selectedTurnId !== turnId) {
+      // The selection moved on while the tree was loading: fetch the one that
+      // is on screen now instead of dropping the result.
+      await loadTree();
+      return;
+    }
     state.tree = tree;
     state.treeError = null;
     state.layout = layoutTree(tree?.nodes);
+    state.hotspots = computeHotspots(tree);
     if (state.selectedNodeId && !state.layout.byId.has(state.selectedNodeId)) {
       state.selectedNodeId = null;
     }
@@ -1593,6 +1992,7 @@ function connectStream() {
       state.tree = tree;
       state.treeError = null;
       state.layout = layoutTree(tree.nodes);
+      state.hotspots = computeHotspots(tree);
       if (state.selectedNodeId && !state.layout.byId.has(state.selectedNodeId)) {
         state.selectedNodeId = null;
       }
@@ -1712,6 +2112,38 @@ function bindControls() {
   els.btnDetail.addEventListener('click', () => {
     setDetailCollapsed(!els.layout.classList.contains('detail-collapsed'));
   });
+
+  // The two hotspot chips jump straight to the card they stand for.
+  els.hotToken.addEventListener('click', () => {
+    jumpToNode(els.hotToken.dataset.nodeId);
+  });
+  els.hotTime.addEventListener('click', () => {
+    jumpToNode(els.hotTime.dataset.nodeId);
+  });
+
+  // The two leaderboards: the ten most expensive cards, by time and by token.
+  els.rankToken.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleRankPanel('token');
+  });
+  els.rankTime.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleRankPanel('time');
+  });
+  els.rankClose.addEventListener('click', (event) => {
+    event.stopPropagation();
+    closeRankPanel();
+  });
+
+  // Clicking anywhere else puts the leaderboard away.
+  document.addEventListener('click', (event) => {
+    if (!state.rankMode) return;
+    if (els.rankPanel?.contains(event.target)) return;
+    closeRankPanel();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeRankPanel();
+  });
 }
 
 function collectElements() {
@@ -1730,6 +2162,21 @@ function collectElements() {
     turnCount: byId('turn-count'),
     turnList: byId('turn-list'),
     treeHint: byId('tree-hint'),
+    treeStats: byId('tree-stats'),
+    statDuration: byId('stat-duration'),
+    statTokens: byId('stat-tokens'),
+    statCache: byId('stat-cache'),
+    statActions: byId('stat-actions'),
+    hotToken: byId('hot-token'),
+    hotTokenLabel: byId('hot-token-label'),
+    hotTime: byId('hot-time'),
+    hotTimeLabel: byId('hot-time-label'),
+    rankPanel: byId('rank-panel'),
+    rankCaption: byId('rank-caption'),
+    rankList: byId('rank-list'),
+    rankClose: byId('rank-close'),
+    rankToken: byId('btn-rank-token'),
+    rankTime: byId('btn-rank-time'),
     btnFit: byId('btn-fit'),
     btnRefresh: byId('btn-refresh'),
     btnExportHtml: byId('btn-export-html'),

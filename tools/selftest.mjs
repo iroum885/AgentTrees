@@ -40,7 +40,15 @@ import {
   workspaceLabel,
 } from '../scripts/lib/registry.mjs';
 import { parseSessionMessages } from '../scripts/lib/transcript.mjs';
+import { decorateTreeWithUsage } from '../scripts/lib/usage.mjs';
 import { treeToMarkdown, treeToHtml } from '../scripts/lib/export.mjs';
+import {
+  actionTargets,
+  deriveBasis,
+  deriveWhy,
+  extractOutputText,
+  splitSentences,
+} from '../scripts/lib/evidence.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -407,6 +415,117 @@ check('reasoning nodes form a chain (depth > 1)', (tree?.nodes?.length ?? 0) > 0
   && Math.max(...tree.nodes.map((n) => n.level)) >= 2,
   `maxLevel=${tree ? Math.max(...tree.nodes.map((n) => n.level)) : -1}`);
 
+// ------------------------------------------------------- decision evidence
+section('Decision evidence');
+check('a Chinese sentence ends at the full stop',
+  splitSentences('先看目录。再读文件。').length === 2, JSON.stringify(splitSentences('先看目录。再读文件。')));
+check('a file name inside a sentence does not split it',
+  splitSentences('读取 app.js 的渲染代码。').length === 1,
+  JSON.stringify(splitSentences('读取 app.js 的渲染代码。')));
+
+const envelope = JSON.stringify({ content: [{ type: 'text', text: 'line one\nline two' }] });
+check('a complete output envelope yields its text',
+  extractOutputText(envelope) === 'line one\nline two', extractOutputText(envelope));
+const truncated = '{"content": [{"type": "text", "text": "line one\\nline two\\nline thr';
+const truncatedText = extractOutputText(truncated);
+check('a cut-short output still yields its text', truncatedText.includes('line one'), truncatedText);
+check('a cut-short output keeps its line breaks', truncatedText.includes('\n'), JSON.stringify(truncatedText));
+const twice = JSON.stringify(JSON.stringify({ content: [{ type: 'text', text: 'hello\nworld' }] }));
+check('a twice encoded output is unwrapped', extractOutputText(twice) === 'hello\nworld',
+  extractOutputText(twice));
+
+const readTargets = actionTargets('read', { file_path: 'D:\\work\\ui\\app.js' }, 'D:\\work');
+check('the path of an action is a strong target',
+  readTargets.some((t) => t.strong && t.text.includes('app.js')), JSON.stringify(readTargets));
+check('the bare name of an action is a weak target',
+  readTargets.some((t) => !t.strong && t.text === 'app.js' && t.word), JSON.stringify(readTargets));
+
+const whyText = deriveWhy({
+  thinking: '先确认目录结构。命中在 ui/app.js，接下来读取 ui/app.js 的详情面板代码。',
+  spoken: '我先定位详情面板。',
+  targets: readTargets,
+});
+check('the why names the subject of the action', whyText.includes('ui/app.js'), whyText);
+const spokenWhy = deriveWhy({ thinking: '目录里有 ui、scripts 两个文件夹。', spoken: '我先定位详情面板。', targets: readTargets });
+check('the why falls back to the spoken intent', spokenWhy === '我先定位详情面板。', spokenWhy);
+
+const decided = deriveBasis({
+  targets: readTargets,
+  sources: [
+    { kind: 'execution', label: '前序执行结果', nodeId: 'n9', lines: ['ui/app.js:1205:function renderDetail() {'] },
+    { kind: 'question', label: '用户提问', nodeId: 'n1', lines: ['看看详情面板'] },
+  ],
+});
+check('the basis is the line that pointed at the action',
+  decided?.text === 'ui/app.js:1205:function renderDetail() {', JSON.stringify(decided));
+check('the basis knows where it came from', decided?.kind === 'execution' && decided?.nodeId === 'n9',
+  JSON.stringify(decided));
+const noHit = deriveBasis({
+  targets: readTargets,
+  sources: [{ kind: 'question', label: '用户提问', nodeId: 'n1', lines: ['看看详情面板'] }],
+});
+check('the basis falls back to the request', noHit?.kind === 'question' && noHit?.text === '看看详情面板',
+  JSON.stringify(noHit));
+const noNameHit = deriveBasis({
+  targets: actionTargets('read', { file_path: 'D:\\work\\tree.mjs' }, 'D:\\work'),
+  sources: [{ kind: 'execution', label: '前序执行结果', nodeId: 'n8', lines: ['203→node tools/show-tree.mjs <turnId>'] }],
+});
+check('a file name does not match inside a longer name',
+  !String(noNameHit?.text ?? '').includes('show-tree'), JSON.stringify(noNameHit));
+
+// The same rules have to work on a real tree.
+const evidenceEvents = [
+  { kind: 'user_prompt', ts: 1000, data: { text: '把详情面板补上归因信息' } },
+  { kind: 'reasoning', ts: 1100, data: { channel: 'thinking', text: '先定位详情面板的渲染代码。' } },
+  { kind: 'reasoning', ts: 1100, data: { channel: 'text', text: '我先找到详情面板的渲染入口。' } },
+  { kind: 'tool_call', ts: 1200, data: { toolUseId: 'e1', tool: 'grep', input: { pattern: 'renderDetail' } } },
+  {
+    kind: 'tool_result',
+    ts: 1300,
+    data: {
+      toolUseId: 'e1',
+      ok: true,
+      output: JSON.stringify({ content: [{ type: 'text', text: 'ui/app.js:1205:function renderDetail() {' }] }),
+    },
+  },
+  { kind: 'reasoning', ts: 1400, data: { channel: 'thinking', text: '既然命中在 ui/app.js，接下来读取 ui/app.js 的详情面板代码。' } },
+  { kind: 'tool_call', ts: 1500, data: { toolUseId: 'e2', tool: 'read', input: { file_path: 'D:\\work\\ui\\app.js' } } },
+  { kind: 'tool_result', ts: 1600, data: { toolUseId: 'e2', ok: true, output: 'ok' } },
+  { kind: 'stop', ts: 1700, data: {} },
+];
+const evidenceTree = buildMechanicalTree(
+  { turnId: 'turn_evidence', events: evidenceEvents },
+  { sessionId: 's', origin: 'live', workspaceRoot: 'D:\\work' },
+);
+const evidenceRead = evidenceTree?.nodes?.find((n) => n.type === 'execution' && n.tool === 'read');
+const evidenceGrep = evidenceTree?.nodes?.find((n) => n.type === 'execution' && n.tool === 'grep');
+check('an execution carries the reason it ran', Boolean(evidenceRead?.why), JSON.stringify(evidenceRead?.why));
+check('the reason names the file that was read', String(evidenceRead?.why ?? '').includes('ui/app.js'),
+  JSON.stringify(evidenceRead?.why));
+check('an execution carries the information that decided it', Boolean(evidenceRead?.basis),
+  JSON.stringify(evidenceRead?.basis));
+check('the deciding line is the grep hit', String(evidenceRead?.basis?.text ?? '').includes('renderDetail'),
+  JSON.stringify(evidenceRead?.basis));
+check('the deciding line points at the node it came from',
+  evidenceRead?.basis?.nodeId === evidenceGrep?.id, JSON.stringify(evidenceRead?.basis));
+const evidenceStrategy = evidenceTree?.nodes?.find(
+  (n) => n.type === 'scheme' && (n.actions ?? []).some((a) => a.tool === 'read'));
+check('the strategy keeps the reason of every action',
+  (evidenceStrategy?.actions ?? []).some((a) => a.tool === 'read' && a.why),
+  JSON.stringify(evidenceStrategy?.actions));
+check('the strategy keeps the deciding line of every action',
+  (evidenceStrategy?.actions ?? []).some((a) => a.tool === 'read' && a.basis?.text),
+  JSON.stringify(evidenceStrategy?.actions));
+check('the strategy keeps the intent it stated',
+  evidenceTree?.nodes?.some((n) => n.type === 'scheme' && n.intent === '我先找到详情面板的渲染入口。'),
+  JSON.stringify(evidenceTree?.nodes?.filter((n) => n.type === 'scheme').map((n) => n.intent)));
+const evidenceMarkdown = treeToMarkdown(evidenceTree);
+check('markdown export writes the reason', evidenceMarkdown.includes('为什么：'), 'no why line');
+check('markdown export writes the deciding line', evidenceMarkdown.includes('决定性信息'), 'no basis line');
+const evidenceHtml = treeToHtml(evidenceTree);
+check('html export writes the reason', evidenceHtml.includes('为什么'), 'no why block');
+check('html export writes the deciding line', evidenceHtml.includes('决定性信息'), 'no basis block');
+
 const listed = listTrees(workspace);
 check('listTrees finds the turn', listed.some((t) => t.turnId === 'turn_selftest_1'));
 check('listTrees does not report a generator any more',
@@ -530,6 +649,87 @@ check('the history tree records the duration',
   JSON.stringify(historyTree?.nodes?.map((n) => n.durationMs)));
 
 fs.rmSync(toolSession, { recursive: true, force: true });
+
+// ------------------------------------------------------------- token attribution
+section('Token attribution');
+const usageSessionId = 'mvs_usage_selftest';
+const usageDir = path.join(
+  REGISTRY_HOME, 'v2', 'sessions', '2026', '11', '02',
+  `00-00-00-000-session_${Buffer.from(usageSessionId, 'utf8').toString('base64').replace(/=+$/, '')}`,
+);
+fs.mkdirSync(usageDir, { recursive: true });
+fs.writeFileSync(path.join(usageDir, 'messages.jsonl'), [
+  JSON.stringify({
+    message_id: 'm1', turn_id: 't1',
+    message: {
+      role: 'assistant', timestamp: 1793600000000, model: 'test-model',
+      content: [
+        { type: 'thinking', thinking: '先读文件，再决定下一步。' },
+        { type: 'toolCall', id: 'call_u1', name: 'read', arguments: { file_path: 'a.txt' } },
+      ],
+      usage: { input: 100, output: 50, cacheRead: 1000, cacheWrite: 0, totalTokens: 1150 },
+    },
+  }),
+  JSON.stringify({
+    message_id: 'm2', turn_id: 't1',
+    message: {
+      role: 'toolResult', toolCallId: 'call_u1', toolName: 'read', isError: false,
+      timestamp: 1793600000500,
+      content: [{ type: 'text', text: 'file body' }],
+    },
+  }),
+  JSON.stringify({
+    message_id: 'm3', turn_id: 't1',
+    message: {
+      role: 'assistant', timestamp: 1793600001000, model: 'test-model',
+      content: [{ type: 'text', text: '读完了。' }],
+      usage: { input: 200, output: 30, cacheRead: 1200, cacheWrite: 0, totalTokens: 1430 },
+    },
+  }),
+].join('\n'), 'utf8');
+
+const usageTree = {
+  turnId: 't1',
+  sessionId: usageSessionId,
+  ts: 1793600000000,
+  nodes: [
+    { id: 'n1', type: 'question', title: '读一下', ts: 1793599999000, durationMs: 1000 },
+    { id: 'n2', type: 'scheme', title: '策略', ts: 1793600000000, durationMs: 400 },
+    { id: 'n3', type: 'execution', title: '读取文件', tool: 'read', toolUseId: 'call_u1', ts: 1793600000100, durationMs: 400 },
+  ],
+};
+decorateTreeWithUsage(usageTree, usageSessionId);
+
+const usageExecution = usageTree.nodes.find((n) => n.type === 'execution');
+const usageScheme = usageTree.nodes.find((n) => n.type === 'scheme');
+check('an action carries its token cost', typeof usageExecution?.tokens?.total === 'number',
+  JSON.stringify(usageExecution?.tokens));
+check('the backfill of an action is measured, not guessed',
+  usageExecution?.tokens?.backfill === 250, JSON.stringify(usageExecution?.tokens));
+check('the generation of an action is counted',
+  usageExecution?.tokens?.gen > 0, JSON.stringify(usageExecution?.tokens));
+check('a strategy carries its thinking tokens',
+  typeof usageScheme?.tokens?.think === 'number' && usageScheme.tokens.think > 0,
+  JSON.stringify(usageScheme?.tokens));
+check('the turn reports its billable tokens',
+  usageTree.totals?.tokens?.billable === 380, JSON.stringify(usageTree.totals?.tokens));
+check('the turn counts its actions',
+  usageTree.totals?.tokens?.actionCount === 1, JSON.stringify(usageTree.totals?.tokens));
+check('the turn reports its duration',
+  typeof usageTree.totals?.durationMs === 'number' && usageTree.totals.durationMs > 0,
+  JSON.stringify(usageTree.totals?.durationMs));
+
+const usageMarkdown = treeToMarkdown(usageTree);
+check('markdown export carries the token totals', usageMarkdown.includes('总 token 380'),
+  usageMarkdown.split('\n').find((l) => l.includes('统计')) ?? 'no totals line');
+check('markdown export carries the token of a node', usageMarkdown.includes('token：'),
+  usageMarkdown.split('\n').find((l) => l.includes('token')) ?? 'no token line');
+
+const noUsageTree = { turnId: 't2', sessionId: 'mvs_missing', nodes: [] };
+decorateTreeWithUsage(noUsageTree, 'mvs_missing');
+check('a missing session log leaves the tree alone', noUsageTree.totals === undefined,
+  JSON.stringify(noUsageTree.totals));
+
 fs.rmSync(workspace, { recursive: true, force: true });
 
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
